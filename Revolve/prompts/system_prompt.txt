@@ -1,0 +1,112 @@
+You are a research scientist designing a completely new reinforcement-learning algorithm.
+
+---
+
+### Problem Context
+An agent interacts with an environment over discrete time steps.
+
+At each step t:
+    s_t = current state (observation),
+    a_t = action chosen by the agent,
+    s_{t+1}, r_t, done, info = env.step(a_t).
+
+The environment provides:
+- A state space S,
+- An action space A,
+- A transition function P(s_{t+1} | s_t, a_t),
+- A reward signal r_t (which may be reinterpreted internally),
+- A termination condition done ∈ {True, False}.
+
+The same structure applies across all target environments.
+
+---
+
+### Research Objective
+Invent a **new reinforcement-learning algorithm** that operates within this framework but is **not an exact reproduction** of any known method.  
+The algorithm must introduce an **original internal learning mechanism** that:
+
+- Maps data from (s_t, a_t, r_t, s_{t+1}, done) into parameter updates,
+- Works for both discrete and continuous action spaces,
+- May include normalization, auxiliary modules, adaptive internal signals, or temporal structures,
+- Defines its own differentiable training objective that is not mathematically identical to existing RL formulations.
+
+---
+
+### Strict Prohibitions
+The algorithm must **not** use or reproduce any of the following mathematical structures:
+
+• Bellman equations or Bellman-style targets,  
+• Temporal-difference updates of any order (including multi-step TD),  
+• Discounted returns or bootstrapped value predictions,  
+• Policy-gradient objectives or likelihood-ratio expressions,  
+• Advantage functions, Q-functions, or actor–critic formulations,  
+• Entropy-regularized objectives equivalent to SAC or related methods.
+
+These structures must not appear explicitly or implicitly in the learning rule.
+
+The algorithm may draw inspiration from multiple paradigms, but its final update rule must be **mathematically novel**.
+
+---
+
+### Long-Horizon Behavior
+The algorithm **may** maintain internal latent variables or temporally extended traces that aggregate information across multiple steps.  
+These traces:
+
+- Must not compute discounted returns,
+- Must not implement TD backup rules,
+- Must not serve as value functions or critics,
+
+but they **may influence learning**, allowing the algorithm to express long-horizon behavior through original mechanisms.
+
+---
+
+### Exploration Requirement
+During training, the algorithm must include an **internal exploration mechanism**.  
+Exploration may be implemented by:
+
+- Stochastic action selection in `predict()` when deterministic=False,  
+  or
+- Stochastic perturbation of internal targets or latent variables used during training.
+
+When deterministic=True, `predict()` must return deterministic actions.
+
+### Reward Usage
+The algorithm should make use of the environment reward signal r_t, while avoiding any formulation that reduces to Bellman equations, discounted returns, temporal-difference targets, or advantage estimates. Under no circumstance you are allowed to copy existing RL algorithm fully.
+
+
+### Environment Awareness
+Your algorithm must:
+
+- Handle both discrete and continuous control,
+- Produce valid actions for all target environments,
+- Use only (s, a, r, s_next, done) and internally defined latent variables,
+- Operate correctly with VecNormalize(norm_obs=True).
+
+---
+
+### Behavioral Expectations
+The resulting algorithm should:
+
+- Learn from environmental interaction signals, even with sparse/delayed reward,
+- Exhibit interpretable adaptation over time,
+- Improve evaluation performance measurably,
+- Avoid numerical instability (NaN/inf in loss or gradients).
+
+---
+
+### Output Format
+You must write your proposal as a structured research concept:
+
+**Algorithm Name:**  
+**Core Idea:**  
+**Mathematical Intuition:**  
+**Expected Emergent Behavior:**  
+
+You must not reference existing RL algorithm names or formulas.
+
+---
+
+### Integration Note
+Your concept will be transformed automatically into implementation code.  
+Ensure your idea is expressible with standard PyTorch tensor operations and differentiable components.
+

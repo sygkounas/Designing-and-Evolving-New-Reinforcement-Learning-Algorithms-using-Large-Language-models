@@ -1,0 +1,74 @@
+==============================
+EVOLUTIONARY OPERATOR: STRUCTURAL MACRO-MUTATION
+==============================
+
+Your task is to apply a **STRUCTURAL MACRO-MUTATION** to the given algorithm.
+
+This operator authorizes a substantial rewrite of EXACTLY one major internal
+mechanisms of the algorithm (e.g., learning signal generation, latent-processing
+flows, shaping logic, internal consistency mechanisms), but in a **directed** way:
+the mutation must be guided by the observed performance in the metrics, fitness
+summary, and any runtime errors.
+
+Use these signals to identify which internal mechanisms are underperforming,
+unstable, misaligned, or uninformative, and redesign the relevant internal
+components to correct these weaknesses. Mutations must not be arbitrary; they
+must be **justified by the failure patterns** visible in the provided results.
+
+The external API, class name, method names, policy architecture, optimizer,
+action-generation rules, and all refinement-stage restrictions remain unchanged.
+Only the internal learning logic may be structurally rewritten.
+
+---
+
+### Input Algorithm
+python '''
+{Your_Algorithm}
+'''
+
+### Historical Metrics
+{Metrics}
+
+### Fitness Summary
+{Fitness}
+
+### Runtime Errors
+{Errors}
+
+---
+
+### Output
+Return the complete mutated of the algorithm as a full Python class named `NewAlgo`.
+Computation Budget:
+  All algorithms receive the same total number of environment steps (e.g., 1 M).
+  The rollout_len parameter in the base code only defines how often data are collected before an update call.
+  You may internally decide how to use that data (full-batch, online, replay, or streaming),
+  but you must stay within the same total sample budget for fairness.
+Rules:
+- Keep the **same policy network** for action output (two 256-unit Tanh layers + linear head) and the **same optimizer** (Adam, lr=3e-4).  
+  You may add auxiliary modules, but do not alter the action policy’s architecture or optimizer hyperparameters.  
+- Keep all import statements at the **top of the file**, outside the class. Never import inside the class or assign modules to `self` (e.g., `self.torch = torch` is forbidden).  
+- Use decorators directly (e.g., `@torch.no_grad()`), never `@self.torch.no_grad()`.  
+- Do not redesign exploration. You may adjust at most one scalar exploration-strength parameter for training (deterministic=False). When deterministic=True, evaluation must be fully deterministic.
+- Keep the existing class and method names (`__init__`, `predict`, `learn`, `compute_loss`, `_update`), so the code remains compatible with the evaluation pipeline.  
+- The  algorithm must prioritize stable training: no exploding exploration, no action-shape changes, and no redefinition of the policy network
+- predict() must always return actions with correct shape: (act_dim,) for continuous or an integer for discrete. Do not add batch dimensions.
+-However, the internal learning logic must not directly reproduce any known RL training formula such as policy-gradient, TD, or Bellman-style updates.  
+-The algorithm should not rely on explicit advantage estimates, critic targets, or likelihood-ratio terms.  
+-Reward may be used in any differentiable way but not inside any policy-gradient, TD, or Bellman-style update.  
+-The method must remain distinct from all known RL algorithms (e.g., PPO, A2C, REINFORCE, TD(λ), SAC, or Q-learning).  
+
+Important:
+You are free to define entirely new update rules or gradient signals, even if they deviate from conventional RL training, as long as they remain differentiable and trainable in PyTorch.  
+You may combine or adapt principles from multiple paradigms to create a genuinely new mechanism that is not a copy or reimplementation of any existing RL algorithm.  
+The algorithm must optimize behavior over long-horizon consequences rather than only immediate rewards. It must incorporate internal reasoning that reflects multi-step outcomes without using returns, advantages, TD updates, Q-values, critics, or any value-based targets.
+You are permitted to maintain temporally extended internal quantities that influence learning, as long as they do not compute or imitate returns, advantages, TD targets, Q-values, or critic functions.
+Very important: You must ensure that the algorithm can work for the environemnts meaning long term planning horizon.
+
+
+Your output must be inside python ''' NewAlgo ''' and the name of the class must be exactly this NewAlgo.
+Style of output:
+python '''
+<imports>
+<class NewAlgo ...>
+'''

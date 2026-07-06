@@ -1,0 +1,760 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import gymnasium as gym
+from typing import Dict
+from torch.utils.tensorboard import SummaryWriter
+from torch.distributions import Categorical
+import os, json
+from typing import Optional 
+
+
+class NewAlgo:
+    """
+    STRUCTURAL CROSSOVER RESULT: Dual-Flow Confidence World Planning + Controllability Planner (DF-CWP-CP)
+
+    Directed crossover rationale from the two in-context parents:
+
+    Parent A strengths (higher overall fitness, notably LunarLander stability):
+      - Robust reward-normalized latent code-flow regularization.
+      - Confidence-weighted differentiable world-model planning with risk penalty.
+      - Auxiliary predictor stabilizing long-horizon latent dynamics.
+      - On-policy updates (stable).
+
+    Parent B strengths (planner provided dense gradients on sparse/flat reward situations):
+      - Counterfactual controllability objective using action-sensitivity ||∂o/∂a||,
+        which can create learning signal even when rewards are uninformative.
+
+    Observed weakness across both histories:
+      - MountainCar frequently stuck at -200 (flat reward), suggesting planning needs
+        a gradient signal beyond reward prediction alone.
+
+    Crossover decision:
+      - Keep Parent A’s world-model + confidence + robust code-flow + dual EMA targets + predictor.
+      - Replace/merge Parent A’s planning objective with Parent B’s controllability-enhanced planner,
+        but *retain Parent A’s risk penalty and conservative horizon (short)* for stability.
+      - Add a small, confidence-gated EMA-anchor regularizer inside planning (Parent B idea) to reduce
+        volatility (helps Acrobot/HalfCheetah stability in traces).
+      - Keep policy architecture fixed (two 256 layers + linear head). Keep Adam optimizer and budgets.
+
+    Not RL by forbidden methods:
+      - No log-prob ratios, no policy gradients, no TD/Bellman, no Q/critic, no advantage/returns.
+      - The policy is shaped by differentiating through short imagined rollouts and by latent-flow
+        regularizers on real transitions.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        lr=3e-4,
+        rollout_len=2048,
+        epochs=6,
+        batch_size=512,
+        save_every=10000,
+        eval_interval=5000,
+        verbose=1,
+        log_dir="runs/NewAlgo",
+        device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+        algo_cfg: Optional[dict] = None,   # <<< ADD THIS
+    ):
+        self.env = env
+        self.verbose = verbose
+        self.device = device
+        self.rollout_len = rollout_len
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.save_every = save_every
+        self.eval_interval = eval_interval
+
+        # ----- Spaces -----
+        obs_shape = env.observation_space.shape
+        assert obs_shape is not None, "Observation space must be shaped (Box)."
+        self.obs_dim = int(np.prod(obs_shape))
+
+        self.is_discrete = isinstance(env.action_space, gym.spaces.Discrete)
+        if self.is_discrete:
+            self.act_dim = env.action_space.n
+            self.act_low = None
+            self.act_high = None
+        else:
+            self.act_dim = int(np.prod(env.action_space.shape))
+            self.act_low = torch.as_tensor(env.action_space.low, dtype=torch.float32, device=self.device)
+            self.act_high = torch.as_tensor(env.action_space.high, dtype=torch.float32, device=self.device)
+            self.act_center = 0.5 * (self.act_high + self.act_low)
+            self.act_half = 0.5 * (self.act_high - self.act_low + 1e-6)
+
+        # ----- Policy Network (fixed architecture; trunk activations chosen by learning signal) -----
+        # We keep bounded latent codes z=tanh(logits) as a core learning signal for code-flow shaping
+        # and continuous action mapping. Using SiLU/ReLU here would remove the naturally bounded
+        # intermediate representation and change the geometry of flow matching; therefore keep Tanh.
+        class PolicyNet(nn.Module):
+            def __init__(self, obs_dim, act_dim, is_discrete, hidden=256):
+                super().__init__()
+                self.is_discrete = is_discrete
+                self.trunk = nn.Sequential(
+                    nn.Linear(obs_dim, hidden), nn.Tanh(),
+                    nn.Linear(hidden, hidden), nn.Tanh(),
+                )
+                self.head = nn.Linear(hidden, act_dim)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                h = self.trunk(x)
+                return self.head(h)
+
+        self.policy = PolicyNet(self.obs_dim, self.act_dim, self.is_discrete).to(self.device)
+
+        # ----- Dual EMA Target Policies (fast + slow) -----
+        self.target_policy_fast = PolicyNet(self.obs_dim, self.act_dim, self.is_discrete).to(self.device)
+        self.target_policy_fast.load_state_dict(self.policy.state_dict())
+        self.target_policy_fast.eval()
+        for p in self.target_policy_fast.parameters():
+            p.requires_grad_(False)
+
+        self.target_policy_slow = PolicyNet(self.obs_dim, self.act_dim, self.is_discrete).to(self.device)
+        self.target_policy_slow.load_state_dict(self.policy.state_dict())
+        self.target_policy_slow.eval()
+        for p in self.target_policy_slow.parameters():
+            p.requires_grad_(False)
+
+        self.ema_fast = 0.995
+        self.ema_slow = 0.9995
+
+        # ----- World Models and Confidence -----
+        act_embed_dim = self.act_dim
+        hsize = 256
+
+        self.forward_model = nn.Sequential(
+            nn.Linear(self.obs_dim + act_embed_dim, hsize), nn.Tanh(),
+            nn.Linear(hsize, hsize), nn.Tanh(),
+            nn.Linear(hsize, self.obs_dim)
+        ).to(self.device)
+
+        self.reward_model = nn.Sequential(
+            nn.Linear(self.obs_dim + act_embed_dim + self.obs_dim, hsize), nn.Tanh(),
+            nn.Linear(hsize, hsize), nn.Tanh(),
+            nn.Linear(hsize, 1)
+        ).to(self.device)
+
+        self.done_model = nn.Sequential(
+            nn.Linear(self.obs_dim, hsize), nn.Tanh(),
+            nn.Linear(hsize, hsize), nn.Tanh(),
+            nn.Linear(hsize, 1)
+        ).to(self.device)
+
+        self.conf_dyn = nn.Sequential(
+            nn.Linear(self.obs_dim + act_embed_dim, hsize), nn.Tanh(),
+            nn.Linear(hsize, hsize), nn.Tanh(),
+            nn.Linear(hsize, 1)
+        ).to(self.device)
+
+        self.conf_r = nn.Sequential(
+            nn.Linear(self.obs_dim + act_embed_dim + self.obs_dim, hsize), nn.Tanh(),
+            nn.Linear(hsize, hsize), nn.Tanh(),
+            nn.Linear(hsize, 1)
+        ).to(self.device)
+
+        self.conf_done = nn.Sequential(
+            nn.Linear(self.obs_dim, hsize), nn.Tanh(),
+            nn.Linear(hsize, hsize), nn.Tanh(),
+            nn.Linear(hsize, 1)
+        ).to(self.device)
+
+        # ----- Auxiliary code predictor (kept; predicts slow-code next) -----
+        # Predictor is used only as a gentle long-horizon latent prior; keep bounded tanh output.
+        class PredictorNet(nn.Module):
+            def __init__(self, in_dim, out_dim, hidden=256):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(in_dim, hidden), nn.Tanh(),
+                    nn.Linear(hidden, hidden), nn.Tanh(),
+                    nn.Linear(hidden, out_dim)
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.net(x)
+
+        self.code_predictor = PredictorNet(self.obs_dim + act_embed_dim, self.act_dim).to(self.device)
+
+        # ----- Optimizer (fixed: Adam, lr) -----
+        self.opt = optim.Adam(
+            list(self.policy.parameters()) +
+            list(self.forward_model.parameters()) +
+            list(self.reward_model.parameters()) +
+            list(self.done_model.parameters()) +
+            list(self.conf_dyn.parameters()) +
+            list(self.conf_r.parameters()) +
+            list(self.conf_done.parameters()) +
+            list(self.code_predictor.parameters()),
+            lr=lr
+        )
+
+        # ----- Rollout Buffer (on-policy) -----
+        class RolloutBuffer:
+            def __init__(self, outer):
+                self.outer = outer
+                self.reset()
+
+            def add(self, s, a, r, s_next, done):
+                self.s.append(s)
+                if not self.outer.is_discrete:
+                    a = np.asarray(a, dtype=np.float32).reshape(self.outer.act_dim)
+                self.a.append(a)
+                self.r.append(r)
+                self.s_next.append(s_next)
+                self.done.append(done)
+
+            def _to_t(self, x, dt):
+                return torch.as_tensor(np.array(x), dtype=dt, device=self.outer.device)
+
+            def tensors(self) -> Dict[str, torch.Tensor]:
+                out = {
+                    "s": self._to_t(self.s, torch.float32).view(len(self.s), -1),
+                    "r": self._to_t(self.r, torch.float32).view(-1, 1),
+                    "s_next": self._to_t(self.s_next, torch.float32).view(len(self.s_next), -1),
+                    "done": self._to_t(self.done, torch.float32).view(-1, 1),
+                }
+                if self.outer.is_discrete:
+                    out["a"] = self._to_t(self.a, torch.long).view(-1, 1)
+                else:
+                    out["a"] = self._to_t(self.a, torch.float32).view(len(self.a), -1)
+                return out
+
+            def reset(self):
+                self.s, self.a, self.r, self.s_next, self.done = [], [], [], [], []
+
+        self.buffer = RolloutBuffer(self)
+
+        # ----- Logging -----
+ 
+        self.writer = SummaryWriter(log_dir)
+        self.log_dir = log_dir
+        self.metrics = {"steps": [], "loss": [], "grad_norm": [], "param_norm": [], "eval_reward": []}
+
+        # ----- Schedules -----
+        self.steps_done = 0
+        self.update_steps = 0
+
+        self.explore_horizon = 500_000
+        self.temp_max, self.temp_min = 2.0, 0.5
+        self.eps_max, self.eps_min = 0.20, 0.00
+        self.sigma_max, self.sigma_min = 0.26, 0.05
+
+        # ----- Planning hyperparameters -----
+        # Keep short horizon (Parent A stability) but inject controllability objective (Parent B).
+        self.plan_horizon = 3
+        self.plan_temperature = 1.0
+        self.gamma = 0.97
+        self.terminal_cost = 0.5
+
+        self.warmup_updates = 40
+        self.max_plan_weight = 1.0
+
+        # Planning regularization
+        self.entropy_coef_max = 0.05
+        self.entropy_coef_min = 0.005
+        self.action_l2_max = 0.01
+        self.action_l2_min = 0.001
+        self.logit_l2_coef = 0.001
+        self.plan_state_l2 = 1e-5
+
+        # Risk penalty (Parent A)
+        self.risk_coef_max = 0.05
+        self.risk_coef_min = 0.0
+
+        # Controllability planning weights (Parent B-inspired)
+        self.ctrl_weight = 0.18
+        self.ctrl_clip = 5.0
+        self.obj_clip = 10.0
+        self.jac_reg_weight = 0.02
+
+        # EMA anchor during planning (stability)
+        self.anchor_weight = 0.08
+        self.anchor_conf_floor = 0.15
+
+        # ----- World-model loss weights -----
+        self.w_dyn = 1.0
+        self.w_r = 1.0
+        self.w_done = 0.5
+        self.w_conf = 0.2
+
+        self.conf_k_dyn = 5.0 / max(1, self.obs_dim)
+        self.conf_k_r = 1.0
+        self.conf_k_done = 2.0
+
+        # ----- Code-flow hyperparameters (Parent A core) -----
+        self.r_loc = torch.tensor(0.0, device=self.device)
+        self.r_scale = torch.tensor(1.0, device=self.device)
+        self.r_ema_beta = 0.05
+        self.r_gain = 1.2
+        self.r_clip = 3.0
+
+        self.c_align = 0.5
+        self.c_flow_fast = 0.12
+        self.c_flow_slow = 0.10
+        self.c_smooth = 0.03
+        self.c_energy = 5e-3
+        self.cos_target = 0.6
+        self.action_margin = 0.2
+        self.flow_margin = 0.2
+
+        self.code_weight = 0.7
+        self.pred_weight = 0.06
+        if algo_cfg is not None:
+            print("setting values in the algorithm")
+            for k, v in algo_cfg.items():
+                if hasattr(self, k):
+                    setattr(self, k, v)
+
+
+    # ----- Helpers -----
+    def _flatten_obs(self, obs):
+        if isinstance(obs, tuple):
+            obs = obs[0]
+        return torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=self.device).view(1, -1)
+
+    def _exploration_factors(self):
+        frac = float(min(1.0, self.steps_done / max(1, self.explore_horizon)))
+        temp = self.temp_max - (self.temp_max - self.temp_min) * frac
+        eps = self.eps_max - (self.eps_max - self.eps_min) * frac
+        sigma = self.sigma_max - (self.sigma_max - self.sigma_min) * frac
+        return temp, eps, sigma
+
+    def _toggle_requires_grad(self, modules, flag: bool):
+        for m in modules:
+            for p in m.parameters():
+                p.requires_grad = flag
+
+    def _update_targets(self):
+        with torch.no_grad():
+            tau_f = self.ema_fast
+            for p_tgt, p in zip(self.target_policy_fast.parameters(), self.policy.parameters()):
+                p_tgt.data.mul_(tau_f).add_(p.data, alpha=(1.0 - tau_f))
+            tau_s = self.ema_slow
+            for p_tgt, p in zip(self.target_policy_slow.parameters(), self.policy.parameters()):
+                p_tgt.data.mul_(tau_s).add_(p.data, alpha=(1.0 - tau_s))
+
+    # ----- Policy execution -----
+    @torch.no_grad()
+    def predict(self, obs, deterministic: bool = True):
+        x = self._flatten_obs(obs)
+        out = self.policy(x).squeeze(0)
+
+        if self.is_discrete:
+            if deterministic:
+                return int(torch.argmax(out).item()), None
+
+            temp, eps, _ = self._exploration_factors()
+            if np.random.rand() < eps:
+                return int(torch.randint(0, self.act_dim, (1,)).item()), None
+
+            probs = torch.softmax(out / max(0.1, temp), dim=-1)
+            dist = Categorical(probs=probs)
+            return int(dist.sample().item()), None
+        else:
+            a_norm = torch.tanh(out)
+            if deterministic:
+                act = a_norm
+            else:
+                _, _, sigma = self._exploration_factors()
+                noise = torch.randn_like(a_norm) * sigma
+                act = torch.clamp(a_norm + noise, -1.0, 1.0)
+
+            act = act.cpu().numpy().astype(np.float32)
+            if self.act_low is not None and self.act_high is not None:
+                low = self.act_low.cpu().numpy()
+                high = self.act_high.cpu().numpy()
+                act = low + 0.5 * (act + 1.0) * (high - low)
+            return act, None
+
+    # ----- Rollout collection -----
+    def _collect_rollout(self, total_steps: int):
+        ep_ret = 0.0
+        ep_returns = []
+        obs, info = self.env.reset()
+        steps = 0
+        while steps < total_steps:
+            a, _ = self.predict(obs, deterministic=False)
+            next_obs, r, done, truncated, info = self.env.step(a)
+            ep_ret += r
+
+            a_store = np.asarray(a, dtype=np.float32).reshape(-1) if not self.is_discrete else a
+            self.buffer.add(obs, a_store, r, next_obs, bool(done or truncated))
+
+            obs = next_obs
+            steps += 1
+            self.steps_done += 1
+
+            if done or truncated:
+                ep_returns.append(ep_ret)
+                ep_ret = 0.0
+                obs, info = self.env.reset()
+        return steps, ep_returns
+
+    # ----- Core Loss -----
+    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        s = batch["s"]
+        s_next = batch["s_next"]
+        r = batch["r"]
+        done = batch["done"]
+        N = s.shape[0]
+
+        # ----- Encode observed actions as differentiable codes -----
+        if self.is_discrete:
+            a_idx = batch["a"].view(-1)
+            a_code = F.one_hot(a_idx, num_classes=self.act_dim).float()
+        else:
+            a_raw = batch["a"]
+            if self.act_low is not None and self.act_high is not None:
+                a_code = torch.clamp((a_raw - self.act_center) / self.act_half, -1.0, 1.0)
+            else:
+                a_code = torch.tanh(a_raw)
+
+        # ----- World-model supervision -----
+        dyn_in = torch.cat([s, a_code], dim=1)
+        delta_pred = self.forward_model(dyn_in)
+        delta_true = s_next - s
+        L_dyn = F.smooth_l1_loss(delta_pred, delta_true)
+
+        r_in = torch.cat([s, a_code, s_next], dim=1)
+        r_pred = self.reward_model(r_in)
+        L_r = F.smooth_l1_loss(r_pred, r)
+
+        done_logits = self.done_model(s_next)
+        L_done = F.binary_cross_entropy_with_logits(done_logits, done)
+
+        # Confidence pseudo-targets
+        with torch.no_grad():
+            dyn_err = (delta_pred.detach() - delta_true).pow(2).mean(dim=1, keepdim=True)
+            y_dyn = torch.exp(-self.conf_k_dyn * dyn_err).clamp(0.0, 1.0)
+
+            r_err = (r_pred.detach() - r).pow(2)
+            y_r = torch.exp(-self.conf_k_r * r_err).clamp(0.0, 1.0)
+
+            done_prob = torch.sigmoid(done_logits.detach())
+            done_err = (done_prob - done).pow(2)
+            y_done = torch.exp(-self.conf_k_done * done_err).clamp(0.0, 1.0)
+
+        c_dyn = torch.sigmoid(self.conf_dyn(dyn_in))
+        c_r = torch.sigmoid(self.conf_r(r_in))
+        c_done = torch.sigmoid(self.conf_done(s_next))
+        L_conf = F.mse_loss(c_dyn, y_dyn) + F.mse_loss(c_r, y_r) + F.mse_loss(c_done, y_done)
+
+        L_model = self.w_dyn * L_dyn + self.w_r * L_r + self.w_done * L_done + self.w_conf * L_conf
+
+        # ----- Code-flow regularization with dual EMA flows -----
+        z_raw = self.policy(s)
+        z_next_raw = self.policy(s_next)
+        z = torch.tanh(z_raw)
+        z_next = torch.tanh(z_next_raw)
+
+        with torch.no_grad():
+            z_fast = torch.tanh(self.target_policy_fast(s))
+            z_fast_next = torch.tanh(self.target_policy_fast(s_next))
+            z_slow = torch.tanh(self.target_policy_slow(s))
+            z_slow_next = torch.tanh(self.target_policy_slow(s_next))
+
+        # Robust reward stats update (EMA median/MAD)
+        with torch.no_grad():
+            r_flat = r.view(-1)
+            med = r_flat.median()
+            r_center_b = r_flat - med
+            mad_b = torch.median(torch.abs(r_center_b)) + 1e-3
+            beta = self.r_ema_beta
+            self.r_loc.mul_(1.0 - beta).add_(med * beta)
+            self.r_scale.mul_(1.0 - beta).add_(mad_b * beta)
+            self.r_scale.clamp_(min=1e-3)
+
+        r_norm = torch.clamp((r - self.r_loc) / self.r_scale, -self.r_clip, self.r_clip)
+        g = torch.tanh(self.r_gain * r_norm)
+        w_pos = 0.5 * (g + 1.0)
+        w_neg = 1.0 - w_pos
+        alpha = torch.abs(g)
+        sgn = torch.sign(g + 1e-6)
+
+        y = a_code
+
+        z_n = F.normalize(z, p=2, dim=1, eps=1e-6)
+        y_n = F.normalize(y, p=2, dim=1, eps=1e-6)
+        cos_align = (z_n * y_n).sum(dim=1, keepdim=True)
+        target_cos = self.cos_target * sgn
+        L_align = ((cos_align - target_cos).pow(2) * alpha).mean()
+
+        dcur = z_next - z
+        d_fast = z_fast_next - z_fast
+        d_slow = z_slow_next - z_slow
+
+        dcur_n = F.normalize(dcur, p=2, dim=1, eps=1e-6)
+        d_fast_n = F.normalize(d_fast, p=2, dim=1, eps=1e-6)
+        d_slow_n = F.normalize(d_slow, p=2, dim=1, eps=1e-6)
+
+        cos_flow_fast = (dcur_n * d_fast_n).sum(dim=1, keepdim=True)
+        cos_flow_slow = (dcur_n * d_slow_n).sum(dim=1, keepdim=True)
+
+        flow_weight = 1.0 + 0.5 * done
+
+        L_flow_fast = (
+            flow_weight
+            * (w_pos * F.softplus(self.flow_margin - cos_flow_fast) + w_neg * F.softplus(self.flow_margin + cos_flow_fast))
+        ).mean()
+
+        L_flow_slow = (
+            flow_weight
+            * (w_pos * F.softplus(self.flow_margin - cos_flow_slow) + w_neg * F.softplus(self.flow_margin + cos_flow_slow))
+        ).mean()
+
+        L_smooth = dcur.pow(2).sum(dim=1).mean()
+        L_energy = (z.pow(2).mean() + z_next.pow(2).mean())
+
+        diff = z - y
+        dnorm = torch.norm(diff, dim=1, keepdim=True)
+        L_match = (w_pos * dnorm.pow(2) + w_neg * F.softplus(self.action_margin - dnorm)).mean()
+
+        L_code = (
+            self.c_align * L_align
+            + self.c_flow_fast * L_flow_fast
+            + self.c_flow_slow * L_flow_slow
+            + self.c_smooth * L_smooth
+            + self.c_energy * L_energy
+            + 0.5 * self.c_align * L_match
+        )
+
+        # ----- Auxiliary predictor in slow code space -----
+        with torch.no_grad():
+            target_code_next_slow = z_slow_next
+        pred_in = torch.cat([s, a_code], dim=1)
+        pred_code_next = torch.tanh(self.code_predictor(pred_in))
+        L_pred = F.mse_loss(pred_code_next, target_code_next_slow)
+
+        # ----- Crossover Planning: risk-aware controllability planner (merged A+B) -----
+        # Freeze models for planning; update only the policy through imagined rollouts.
+        modules_to_freeze = [
+            self.forward_model, self.reward_model, self.done_model,
+            self.conf_dyn, self.conf_r, self.conf_done, self.code_predictor
+        ]
+        self._toggle_requires_grad(modules_to_freeze, False)
+        try:
+            s_plan = s
+            discount = 1.0
+
+            # accumulators
+            G = torch.zeros((N, 1), device=self.device)            # desirability accumulator (not TD return)
+            ctrl_obj = torch.zeros((N, 1), device=self.device)     # controllability accumulator
+            jac_reg = torch.zeros((N, 1), device=self.device)      # discourages extreme sensitivity exploitation
+
+            # regularizers
+            ent_reg = torch.zeros((N, 1), device=self.device)
+            act_reg = torch.zeros((N, 1), device=self.device)
+            logit_reg = torch.zeros((N, 1), device=self.device)
+            state_reg = torch.zeros((N, 1), device=self.device)
+            anchor_reg = torch.zeros((N, 1), device=self.device)
+
+            for _ in range(self.plan_horizon):
+                logits = self.policy(s_plan)
+                z_plan = torch.tanh(logits)
+
+                if self.is_discrete:
+                    p = torch.softmax(z_plan / max(0.1, self.plan_temperature), dim=-1)
+                    a_plan = p
+                    ent = -(p * (p.clamp_min(1e-8).log())).sum(dim=-1, keepdim=True)
+                    ent_reg = ent_reg + ent
+                    logit_reg = logit_reg + logits.pow(2).mean(dim=-1, keepdim=True)
+                else:
+                    a_plan = z_plan
+                    act_reg = act_reg + a_plan.pow(2).mean(dim=-1, keepdim=True)
+                    logit_reg = logit_reg + logits.pow(2).mean(dim=-1, keepdim=True)
+
+                # EMA anchor action from slow target (stable reference)
+                with torch.no_grad():
+                    logits_t = self.target_policy_slow(s_plan)
+                    z_t = torch.tanh(logits_t)
+                    if self.is_discrete:
+                        a_t = torch.softmax(z_t / max(0.1, self.plan_temperature), dim=-1)
+                    else:
+                        a_t = z_t
+
+                # model step
+                delta_hat = self.forward_model(torch.cat([s_plan, a_plan], dim=1))
+                s_next_hat = s_plan + delta_hat
+                r_hat = self.reward_model(torch.cat([s_plan, a_plan, s_next_hat], dim=1)).clamp(-self.obj_clip, self.obj_clip)
+                d_hat = torch.sigmoid(self.done_model(s_next_hat))
+
+                c_dyn_p = torch.sigmoid(self.conf_dyn(torch.cat([s_plan, a_plan], dim=1)))
+                c_r_p = torch.sigmoid(self.conf_r(torch.cat([s_plan, a_plan, s_next_hat], dim=1)))
+                c_done_p = torch.sigmoid(self.conf_done(s_next_hat))
+                c_all = (c_dyn_p * c_r_p * c_done_p).clamp(0.0, 1.0)
+
+                # risk schedule (Parent A)
+                frac = float(min(1.0, self.steps_done / max(1, self.explore_horizon)))
+                risk_coef = self.risk_coef_max - (self.risk_coef_max - self.risk_coef_min) * frac
+
+                # bounded desirability (not a return/advantage; just a per-step score)
+                step_score = (r_hat - self.terminal_cost * d_hat)
+                # incorporate risk penalty for low confidence
+                o = c_all * step_score - risk_coef * (1.0 - c_all)
+                o_sat = torch.tanh(o)  # saturation prevents model hacking
+
+                G = G + discount * o_sat
+
+                # controllability: ||∂o/∂a|| (dense signal when rewards are flat)
+                grad_o = torch.autograd.grad(
+                    outputs=o_sat.sum(),
+                    inputs=a_plan,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )[0]
+                gnorm = torch.sqrt(grad_o.pow(2).sum(dim=1, keepdim=True) + 1e-8)
+                gnorm_c = torch.clamp(gnorm, 0.0, self.ctrl_clip)
+
+                ctrl_obj = ctrl_obj + discount * (c_all * gnorm_c)
+                jac_reg = jac_reg + discount * (c_all * (gnorm_c / self.ctrl_clip).pow(2))
+
+                # state regularization
+                state_reg = state_reg + s_next_hat.pow(2).mean(dim=-1, keepdim=True)
+
+                # EMA anchor (only matters where model is at least somewhat confident)
+                conf_gate = torch.clamp(c_all, self.anchor_conf_floor, 1.0)
+                if self.is_discrete:
+                    a_n = F.normalize(a_plan, p=2, dim=1, eps=1e-6)
+                    t_n = F.normalize(a_t, p=2, dim=1, eps=1e-6)
+                    anchor_reg = anchor_reg + conf_gate * (1.0 - (a_n * t_n).sum(dim=1, keepdim=True))
+                else:
+                    anchor_reg = anchor_reg + conf_gate * (a_plan - a_t).pow(2).mean(dim=-1, keepdim=True)
+
+                s_plan = s_next_hat
+                discount *= self.gamma
+
+            H = max(1, self.plan_horizon)
+            G = G / H
+            ctrl_obj = ctrl_obj / H
+            jac_reg = jac_reg / H
+            ent_reg = ent_reg / H
+            act_reg = act_reg / H
+            logit_reg = logit_reg / H
+            state_reg = state_reg / H
+            anchor_reg = anchor_reg / H
+
+            # scheduled regularization weights
+            frac = float(min(1.0, self.steps_done / max(1, self.explore_horizon)))
+            entropy_coef = self.entropy_coef_max - (self.entropy_coef_max - self.entropy_coef_min) * frac
+            action_l2 = self.action_l2_max - (self.action_l2_max - self.action_l2_min) * frac
+
+            # loss: maximize G and controllability, minimize regularizers
+            L_plan = (-G.mean()) + (-self.ctrl_weight * ctrl_obj.mean())
+            if self.is_discrete:
+                L_plan = L_plan + entropy_coef * ent_reg.mean()
+            else:
+                L_plan = L_plan + action_l2 * act_reg.mean()
+            L_plan = (
+                L_plan
+                + self.logit_l2_coef * logit_reg.mean()
+                + self.plan_state_l2 * state_reg.mean()
+                + self.anchor_weight * anchor_reg.mean()
+                + self.jac_reg_weight * jac_reg.mean()
+            )
+
+        finally:
+            self._toggle_requires_grad(modules_to_freeze, True)
+
+        # planning weight ramp
+        if self.update_steps <= self.warmup_updates:
+            plan_w = float(self.update_steps) / float(max(1, self.warmup_updates))
+        else:
+            plan_w = self.max_plan_weight
+
+        total_loss = L_model + plan_w * L_plan + self.code_weight * L_code + self.pred_weight * L_pred
+
+        if not torch.isfinite(total_loss):
+            total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+        return total_loss
+
+    # ----- Optimization -----
+    def _update(self):
+        data = self.buffer.tensors()
+        N = data["s"].shape[0]
+        if N == 0:
+            return {"loss": 0.0, "grad_norm": 0.0, "param_norm": 0.0}
+
+        idx = torch.arange(N, device=self.device)
+        losses, grad_norms, param_norms = [], [], []
+        for _ in range(self.epochs):
+            perm = torch.randperm(N, device=self.device)[: self.batch_size] if N > self.batch_size else idx
+            batch = {k: v[perm] for k, v in data.items()}
+
+            loss = self.compute_loss(batch)
+            self.opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            params = (
+                list(self.policy.parameters())
+                + list(self.forward_model.parameters())
+                + list(self.reward_model.parameters())
+                + list(self.done_model.parameters())
+                + list(self.conf_dyn.parameters())
+                + list(self.conf_r.parameters())
+                + list(self.conf_done.parameters())
+                + list(self.code_predictor.parameters())
+            )
+            grad_norm = float(nn.utils.clip_grad_norm_(params, 1.0))
+            self.opt.step()
+            self._update_targets()
+
+            param_vec = torch.nn.utils.parameters_to_vector(params)
+            param_norm = float(param_vec.norm())
+
+            losses.append(float(loss.item()))
+            grad_norms.append(grad_norm)
+            param_norms.append(param_norm)
+
+        self.buffer.reset()
+        self.update_steps += 1
+        return {"loss": float(np.mean(losses)), "grad_norm": float(np.mean(grad_norms)), "param_norm": float(np.mean(param_norms))}
+
+    # ----- Evaluation -----
+    def evaluate(self, n_episodes=5):
+        rewards = []
+        for _ in range(n_episodes):
+            obs, info = self.env.reset()
+            done, truncated, ep_rew = False, False, 0.0
+            while not (done or truncated):
+                a, _ = self.predict(obs, deterministic=True)
+                obs, r, done, truncated, info = self.env.step(a)
+                ep_rew += r
+            rewards.append(ep_rew)
+        return float(np.mean(rewards))
+
+    # ----- Training loop -----
+    def learn(self, total_timesteps: int):
+        steps = 0
+        while steps < total_timesteps:
+            delta_steps, ep_returns = self._collect_rollout(self.rollout_len)
+            steps += delta_steps
+
+            train_r = float(np.mean(ep_returns)) if len(ep_returns) > 0 else 0.0
+            logs = self._update()
+
+            self.writer.add_scalar("train/loss", logs["loss"], steps)
+            self.writer.add_scalar("train/grad_norm", logs["grad_norm"], steps)
+            self.writer.add_scalar("train/param_norm", logs["param_norm"], steps)
+            self.writer.add_scalar("train/reward", train_r, steps)
+            self.writer.add_scalar("stats/r_loc", float(self.r_loc.item()), steps)
+            self.writer.add_scalar("stats/r_scale", float(self.r_scale.item()), steps)
+
+            self.metrics["steps"].append(steps)
+            self.metrics["loss"].append(logs["loss"])
+            self.metrics["grad_norm"].append(logs["grad_norm"])
+            self.metrics["param_norm"].append(logs["param_norm"])
+
+            if steps % self.eval_interval < self.rollout_len:
+                eval_r = self.evaluate()
+                self.metrics["eval_reward"].append(eval_r)
+                self.writer.add_scalar("eval/mean_reward", eval_r, steps)
+                if self.verbose:
+                    print(f"[Eval] Mean reward: {eval_r:.2f}")
+
+        return self
+
+
+        #

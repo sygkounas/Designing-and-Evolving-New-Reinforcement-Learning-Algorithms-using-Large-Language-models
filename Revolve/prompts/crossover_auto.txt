@@ -1,0 +1,92 @@
+==============================
+EVOLUTIONARY OPERATOR: STRUCTURAL CROSSOVER
+==============================
+
+You are given the current reinforcement-learning algorithm below, plus evaluation results,
+historical metric traces, fitness summaries, and any runtime errors.
+
+Your task is to apply a **STRUCTURAL CROSSOVER**: synthesize a new algorithm by integrating
+complementary internal components from **two parent algorithms** (the provided in-context samples).
+You must identify which internal mechanisms of each parent are strong or weak based on their
+reported metrics and fitness, and selectively recombine the strongest modules into a single
+coherent learning system.
+
+Crossover is **directed**, not random: differences in performance across parents must guide
+which parts you preserve, replace, or merge. You may blend, unify, or re-architect internal components,
+but the external API, class name, method names, policy architecture, optimizer, action rules, and
+all refinement-stage restrictions must remain unchanged.
+
+You must preserve:
+  • the class name and all method names,
+  • the fixed policy network layer sizes and head (“two 256-unit layers + linear head (final layer has no activation). Internal trunk activations are part of the learning rule and may be chosen only if justified by the algorithm’s learning signal.”
+  • the optimizer and training budget,
+  • differentiability and PyTorch compatibility,
+  • the environment interface and action-generation rules,
+  • the constraints that forbid standard RL methods (no policy gradients, no TD, no Q, no critics).
+
+You may recombine or redesign internal mechanisms in compute_loss(), internal shaping signals,
+latent transformations, or auxiliary modules. Your crossover must produce a **single** integrated
+learning rule that forms a coherent algorithm rather than a concatenation of fragments.
+
+Use the performance differences between the two parents (reflected in their metrics, fitness,
+and errors) to decide:
+  • which internal components to keep from parent A,
+  • which components to inherit or modify from parent B,
+  • which weak components to discard or rewrite.
+
+---
+
+### Input Algorithm
+python '''
+{Your_Algorithm}
+'''
+
+### Historical Metrics
+{Metrics}
+
+### Fitness Summary
+{Fitness}
+
+### Runtime Errors
+{Errors}
+
+---
+
+### Output
+Return the **complete crossover-derived version** of the algorithm as a full Python class named `NewAlgo`.
+
+Computation Budget:
+  All algorithms receive the same total number of environment steps (e.g., 1 M).
+  The rollout_len parameter only defines how often data are collected before an update call.
+  You may internally decide how to use that data (full-batch, online, replay, or streaming),
+  but must remain within the same total sample budget.
+
+Rules:
+- Keep the **same policy network layer sizes and head** (two 256-unit layers + linear head) and the **same optimizer** (Adam, lr=3e-4).  You may add auxiliary modules, but do not alter the action policy’s architecture or optimizer hyperparameters.  
+- Keep all import statements at the **top of the file**, outside the class. Never import inside the class or assign modules to `self` (e.g., `self.torch = torch` is forbidden).  
+- Use decorators directly (e.g., `@torch.no_grad()`), never `@self.torch.no_grad()`.
+- Activation functions  must NOT be fixed by convention. Any change must be justified by the algorithm’s learning signal in this specific design. Universal claims (e.g., ‘X is always better’) are forbidden. 
+- Keep the existing class and method names (`__init__`, `predict`, `learn`, `compute_loss`, `_update`), so the code remains compatible with the evaluation pipeline.  
+- The  algorithm must prioritize stable training: no exploding exploration, no action-shape changes.
+- predict() must always return actions with correct shape: (act_dim,) for continuous or an integer for discrete. Do not add batch dimensions.
+-However, the internal learning logic must not directly reproduce any known RL training formula such as policy-gradient, TD, or Bellman-style updates.  
+-The algorithm should not rely on explicit advantage estimates, critic targets, or likelihood-ratio terms.  
+-Reward may be used in any differentiable way but not inside any policy-gradient, TD, or Bellman-style update.  
+-The method must remain distinct from all known RL algorithms (e.g., PPO, A2C, REINFORCE, TD(λ), SAC, or Q-learning).  
+-You may improve Auxiliary Networks if needed (size, activation logic) and policynet (only activation function) if needed based on performance but always need to be adapted to the current algorithm.
+
+
+Important:
+You are free to define entirely new update rules or gradient signals, even if they deviate from conventional RL training, as long as they remain differentiable and trainable in PyTorch.  
+You may combine or adapt principles from multiple paradigms to create a genuinely new mechanism that is not a copy or reimplementation of any existing RL algorithm.  
+The algorithm must optimize behavior over long-horizon consequences rather than only immediate rewards. It must incorporate internal reasoning that reflects multi-step outcomes without using returns, advantages, TD updates, Q-values, critics, or any value-based targets.
+You are permitted to maintain temporally extended internal quantities that influence learning, as long as they do not compute or imitate returns, advantages, TD targets, Q-values, or critic functions.
+
+
+Your output must be inside python ''' NewAlgo ''' and the name of the class must be exactly `NewAlgo`.
+Style of output:
+python '''
+<imports>
+<class NewAlgo ...>
+'''
+
