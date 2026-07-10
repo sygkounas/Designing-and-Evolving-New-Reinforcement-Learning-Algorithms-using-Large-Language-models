@@ -29,7 +29,7 @@ class NewAlgo:
         with imperfect learned dynamics/reward/done predictors.
 
     Mutation:
-      - Replace SG-SPD with CG-FPD: Cross-Entropy Guided Fractal Plan Distillation.
+        CG-FPD: Cross-Entropy Guided Fractal Plan Distillation.
         * Sample candidate action SEQUENCES (length H), not constant a0.
         * Evaluate sequences in latent space with survival gating (kept).
         * Use a small CEM-style refinement (no gradients, no RL) to sharpen the teacher:
